@@ -72,7 +72,7 @@ def window_rect(hwnd):
     return Rect.from_ltrb(r.left, r.top, r.right, r.bottom)
 
 
-def render_windows(window):
+def render_windows(window, include_own=False):
     """Ventanas de contenido web (Chrome_RenderWidgetHostHWND) que pertenecen a `window` pero la
     ventana de arriba NO alcanza: contenido alojado en OTRA ventana superior de otro proceso
     (WebView2 es multiproceso; en WhatsApp la ventana de render tiene otro PID). Si la render es de
@@ -84,7 +84,7 @@ def render_windows(window):
         if class_name(kid) != "Chrome_RenderWidgetHostHWND":
             return True
         root = user32.GetAncestor(kid, 2)   # GA_ROOT
-        if root == window:
+        if root == window and not include_own:
             return True
         root_title = window_title(root).strip().lower()
         if len(own_title) >= 3 and len(root_title) >= 3 and (own_title in root_title or root_title in own_title):
@@ -377,7 +377,9 @@ def enumerate_targets(hwnd, area, show_close_tab=False):
             if br.frame_with_numbered_items(target.ctype, target.serial in with_numbered_item):
                 continue
             out.targets.append(target)
-    out.visited, out.elapsed = visited, time.time() - started
+    out.visited = visited
+    find_ghosts(out, hwnd, started)   # capas, superposiciones y enlaces repetidos, antes de dibujar
+    out.elapsed = time.time() - started
     return out
 
 
@@ -700,6 +702,7 @@ class NumberedButtons:
         self.reason = ""          # por qué show() devolvió 0 (va al registro)
         self.active = False
         self._timer = None
+        self._generation = 0      # cada show() la sube: una comprobación de fondo vieja se descarta sola
 
     @property
     def targets(self):
@@ -729,7 +732,23 @@ class NumberedButtons:
         self.overlay.show(result.targets, self.covered, monitor_rect(hwnd))
         self._restart_timer()
         self.log(f"Botones: {len(result.targets)} numerados en {result.elapsed:.2f} s ({result.visited} nodos)")
+        if result.note:
+            self.log("Botones: " + result.note)
+        # los números salen YA; la comprobación de fondo (~33 ms por punto) esconde después los cubiertos
+        if any(target.is_content for target in result.targets):
+            import threading
+            self._generation += 1
+            generation = self._generation
+            threading.Thread(target=self._check_in_background, args=(result, hwnd, self.covered, generation),
+                             daemon=True).start()
         return len(result.targets)
+
+    def _check_in_background(self, result, hwnd, covered, generation):
+        def current():
+            return self.active and generation == self._generation
+        applied = check_points(result, hwnd, covered, current, self.log)
+        if applied and current():
+            self.overlay.redraw(result.targets, covered)
 
     def is_covered(self, number):
         return 1 <= number <= len(self.covered) and self.covered[number - 1]
@@ -781,6 +800,419 @@ class NumberedButtons:
                 self.on_auto_hide()
             except Exception:
                 pass
+
+
+# --- botones fantasma: lo que está en el árbol pero NO a la vista -------------------------------
+# Adaptado de la versión 1.5 (AplicarCamadas, AplicarSobreposicoes, ConferirPontos, PontoPreciso).
+#
+# El árbol de accesibilidad de una página trae también lo que no se ve: diálogos que la página
+# mantiene escondidos (opacity:0 no cuenta como invisible para Chromium), la lista que queda POR
+# DEBAJO de un menú abierto, la pantalla anterior viva detrás de un panel... Sin esto esos botones
+# reciben número "encima" del vídeo o del menú, "yerran la puntería y salen duplicados".
+#
+# Lo que separa lo visible del fantasma es preguntarle a Windows QUÉ HAY DE VERDAD en ese punto
+# (ElementFromPoint). Chromium responde la PRIMERA pregunta por aproximación; la respuesta precisa
+# llega en la SEGUNDA, 10 ms después (medido en la 1.5: sin la espera se equivoca hasta en 11 de 61).
+#
+# Dos momentos: ANTES de dibujar se deciden las capas y las superposiciones (pocos puntos); DESPUÉS,
+# en segundo plano, se comprueban uno a uno los puntos del contenido web (unos 33 ms cada uno): el
+# número de un botón cubierto desaparece, los demás NO cambian (renumerar a mitad de lectura sería
+# peor que el fantasma) y decir un número que desapareció no hace clic.
+# Todo se queda del lado de MANTENER números: un error o una respuesta dudosa nunca borran uno.
+
+CHECK_WAIT = 0.010        # s entre la 1ª y la 2ª pregunta del punto
+CHECK_CAP = 8.0           # s: tope de la comprobación de fondo
+LAYERS_CAP = 0.7          # s: tope de las capas (antes de dibujar)
+OVERLAP_CAP = 1.2         # s: tope de las superposiciones (antes de dibujar)
+ENUM_TOTAL_CAP = 3.6      # s: ENUM_TIMEOUT tiene que sobrar
+_OBJID_CLIENT = 0xFFFFFFFC
+_ROLE_DOCUMENT = 15       # ROLE_SYSTEM_DOCUMENT
+
+
+class PrecisePoint:
+    """Qué ocupa un punto de la pantalla, con dos caminos.
+
+    UIA: ElementFromPoint dos veces. Si la respuesta es el marco WinUI ("Microsoft.UI.Content.", el caso
+    de WhatsApp: WinUI 3 + WebView2) la pregunta se desvía por MSAA a la ventana de RENDER y el botón se
+    reconoce por su RECTÁNGULO. Respuestas: "OK" (es él o algo dentro), "ROUGH" (un ascendiente: la app
+    no detalla el punto), "COVERED" (otra cosa lo ocupa), "ERROR".
+    """
+
+    def __init__(self, uia, window):
+        self.uia, self.walker, self.window = uia, uia.RawViewWalker, window
+        self._msaa_roots = None
+        self.island = False        # ya se vio el marco WinUI: se va directo por MSAA
+        self.last = ""             # descripción de lo último que había en el punto (para el registro)
+
+    def classify(self, point, element, rect, own_pid, layer_rect=None, insist=False):
+        if not self.island:
+            uc, _ = load_uia()
+            pt = uc.tagPOINT(int(point[0]), int(point[1]))
+            self.uia.ElementFromPoint(pt)          # dispara la prueba precisa
+            time.sleep(CHECK_WAIT)
+            hit = self.uia.ElementFromPoint(pt)
+            if not self._is_winui_frame(hit):
+                self.last = self._describe(hit, own_pid)
+                return self._classify_uia(hit, element)
+            self.island = True
+        return self._classify_msaa(point, rect, layer_rect, insist)
+
+    @staticmethod
+    def _is_winui_frame(hit):
+        try:
+            return bool(hit) and (hit.CurrentClassName or "").startswith("Microsoft.UI.Content.")
+        except Exception:
+            return False
+
+    @staticmethod
+    def _describe(hit, own_pid):
+        """Qué había en el punto SIN el texto de la página (el diario no guarda contenido)."""
+        if not hit:
+            return "(nada)"
+        try:
+            cls = (hit.CurrentClassName or "")[:40]
+            return f"tipo={hit.CurrentControlType} cls={cls}" + (" (EL PROPIO XULIA2)" if hit.CurrentProcessId == own_pid else "")
+        except Exception as exc:
+            return f"({exc})"
+
+    def _classify_uia(self, hit, element):
+        """¿Lo que hay en el punto es el propio botón (o algo dentro)? OK. ¿Un ascendiente suyo? ROUGH."""
+        if not hit:
+            return "ERROR"
+        a = hit
+        for _ in range(30):
+            if not a:
+                break
+            if self.uia.CompareElements(a, element):
+                return "OK"
+            a = self.walker.GetParentElement(a)
+        b = self.walker.GetParentElement(element)
+        for _ in range(30):
+            if not b:
+                break
+            if self.uia.CompareElements(b, hit):
+                return "ROUGH"
+            b = self.walker.GetParentElement(b)
+        return "COVERED"
+
+    # --- camino MSAA (WinUI 3 + WebView2) ---
+    def _roots(self):
+        if self._msaa_roots is None:
+            import comtypes.client
+            comtypes.client.GetModule("oleacc.dll")
+            from comtypes.gen import Accessibility as acc
+            self._msaa_roots = []
+            for h in render_windows(self.window):
+                ptr = ctypes.POINTER(acc.IAccessible)()
+                hr = ctypes.windll.oleacc.AccessibleObjectFromWindow(
+                    h, _OBJID_CLIENT, ctypes.byref(acc.IAccessible._iid_), ctypes.byref(ptr))
+                if hr == 0 and ptr:
+                    self._msaa_roots.append((window_rect(h), ptr))
+        return self._msaa_roots
+
+    def _classify_msaa(self, point, rect, layer_rect, insist):
+        root, root_rect = None, Rect()
+        for r, ptr in self._roots():
+            if r.contains_point(*point):
+                root, root_rect = ptr, r
+                break
+        if root is None:
+            self.last = "msaa: sin ventana de render en el punto"
+            return "ERROR"
+        verdict = self._msaa_once(root, root_rect, point, rect, layer_rect, CHECK_WAIT)
+        if verdict == "ROUGH" and insist:
+            verdict = self._msaa_once(root, root_rect, point, rect, layer_rect, 0.060)
+        return verdict
+
+    def _msaa_once(self, root, root_rect, point, rect, layer_rect, wait):
+        hit = self._msaa_hit(root, point, wait)
+        if hit is None:
+            self.last = "msaa: nada"
+            return "ERROR"
+        try:
+            role = hit.accRole(0)
+            role = role if isinstance(role, int) else -1
+        except Exception:
+            role = -1
+        self.last = f"msaa role={role} ({int(wait * 1000)} ms)"
+        if self._has_rect(hit, rect, 30):
+            return "OK"
+        if layer_rect is not None and not layer_rect.is_empty and self._has_rect(hit, layer_rect, 30):
+            return "OK"
+        # el DOCUMENTO entero es la respuesta aproximada: no decide (el número se queda)
+        if role == _ROLE_DOCUMENT or self._has_rect(hit, root_rect, 1):
+            return "ROUGH"
+        # lo que envuelve al botón entero no prueba que esté cubierto (el WhatsApp pone una capa
+        # transparente detrás del menú para cerrarlo con un clic fuera); solo es COVERED cuando OTRA
+        # cosa, que no lo envuelve, ocupa el punto
+        try:
+            x, y, w, h = hit.accLocation(0)
+            if Rect(x - 2, y - 2, w + 4, h + 4).contains_rect(rect):
+                return "ROUGH"
+        except Exception:
+            return "ROUGH"
+        return "COVERED"
+
+    @staticmethod
+    def _msaa_hit(root, point, wait):
+        from comtypes.gen import Accessibility as acc
+        try:
+            root.accHitTest(int(point[0]), int(point[1]))
+        except Exception:
+            pass
+        time.sleep(wait)
+        try:
+            found = root.accHitTest(int(point[0]), int(point[1]))
+        except Exception:
+            return None
+        if isinstance(found, int):
+            if found == 0:
+                return root
+            try:
+                return root.accChild(found).QueryInterface(acc.IAccessible)
+            except Exception:
+                return None
+        try:
+            return found.QueryInterface(acc.IAccessible)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _has_rect(accessible, target, levels):
+        """Subiendo hasta `levels` nodos desde `accessible`: ¿alguno tiene el rectángulo `target` (±2 px)?"""
+        from comtypes.gen import Accessibility as acc
+        a = accessible
+        for _ in range(levels):
+            if a is None:
+                break
+            try:
+                x, y, w, h = a.accLocation(0)
+                if (abs(x - target.x) <= 2 and abs(y - target.y) <= 2
+                        and abs(w - target.width) <= 2 and abs(h - target.height) <= 2):
+                    return True
+            except Exception:
+                pass
+            try:
+                parent = a.accParent
+                a = parent.QueryInterface(acc.IAccessible) if parent else None
+            except Exception:
+                a = None
+        return False
+
+
+def _drop(enumeration, leaving):
+    """Quita de la enumeración los objetivos cuyo índice está en `leaving` (conserva el orden)."""
+    if leaving:
+        enumeration.targets = [t for i, t in enumerate(enumeration.targets) if i not in leaving]
+
+
+def apply_layers(uia, hwnd, enumeration):
+    """Capas (diálogos y menús): decide con 1–2 puntos por capa si está en pantalla. Capa escondida: sus
+    botones salen. Capa visible: salen los botones de la PÁGINA que quedan debajo. Devuelve un resumen."""
+    layer_rects, layer_parent, targets = enumeration.layer_rects, enumeration.layer_parent, enumeration.targets
+    if not layer_rects:
+        return ""
+    started = time.time()
+    precise = PrecisePoint(uia, hwnd)
+    hosted = enumeration.hosted
+    own_pid = os.getpid()
+    # LA PRUEBA DE QUE LA PREGUNTA FUNCIONA AQUÍ: uno o dos botones de la PÁGINA (fuera de capa) tienen
+    # que responder "es él". Si hasta ellos salen "cubierto", la pregunta está rota en esta ventana
+    # (borró todo WhatsApp en la 1.5) y las capas no deciden nada.
+    page = [i for i, t in enumerate(targets) if t.layer < 0 and t.is_content]
+    if page:
+        probe = [page[0]] if len(page) == 1 else [page[0], page[len(page) // 2]]
+        proven = False
+        for i in probe:
+            try:
+                if precise.classify(targets[i].point, targets[i].element, targets[i].rect, own_pid) != "COVERED":
+                    proven = True
+                    break
+            except Exception:
+                proven = True   # un error no prueba que esté rota
+        if not proven:
+            return (f"capas: {len(layer_rects)} -- NO APLICADAS: ni los botones de la página respondieron "
+                    f"al punto en esta ventana ({int((time.time() - started) * 1000)} ms)")
+    state = [-1] * len(layer_rects)
+    for k in range(len(layer_rects)):
+        if time.time() - started > LAYERS_CAP:
+            break   # el resto queda sin veredicto
+        own = [i for i, t in enumerate(targets) if t.layer == k]
+        if not own:
+            continue
+        sample = [own[0]] if len(own) == 1 else [own[0], own[len(own) // 2]]
+        classes = []
+        for i in sample:
+            try:
+                c = precise.classify(targets[i].point, targets[i].element, targets[i].rect, own_pid, layer_rects[k], True)
+            except Exception:
+                c = "ERROR"
+            # En apps con ventana de render propia (WhatsApp) la capa solo se CONFIRMA, nunca se condena:
+            # el punto de una opción de menú responde el botón de la página que cierra el menú.
+            if (precise.island or hosted) and c == "COVERED":
+                c = "UNSURE"
+            classes.append(c)
+            if c == "OK":
+                break
+        state[k] = br.layer_verdict(classes, len(own))
+    leaves = br.decide_by_layers([t.point for t in targets], [t.layer for t in targets], layer_parent, layer_rects, state)
+    _drop(enumeration, {i for i, gone in enumerate(leaves) if gone})
+    hidden, shown, unknown = state.count(0), state.count(1), state.count(-1)
+    return (f"capas: {len(layer_rects)} ({hidden} escondidas, {shown} en pantalla, {unknown} sin veredicto) -- "
+            f"{sum(leaves)} botones fuera, {int((time.time() - started) * 1000)} ms" + (" (por MSAA)" if precise.island else ""))
+
+
+def apply_overlaps(uia, enumeration, budget):
+    """Superposiciones (la pantalla anterior viva por debajo de un panel) y puntería (clic que caería en
+    otro botón). Un botón solo sale con PRUEBA POSITIVA: error, acierto de un tercero (la barra de tareas)
+    o la pregunta que atraviesa dejan el número."""
+    targets = enumeration.targets
+    centers, rects = [t.point for t in targets], [t.rect for t in targets]
+    covering = br.overlays_covering(centers, rects, [t.overlay for t in targets], [t.doc for t in targets],
+                                    enumeration.overlay_parent, enumeration.overlay_rects, enumeration.overlay_doc)
+    partners = br.aim_partners(centers, rects, [t.serial for t in targets], enumeration.parent_of_serial)
+    who_can_hide = [None] * len(targets)
+    under = suspects = 0
+    for i, t in enumerate(targets):
+        if covering[i] is not None and t.is_content:
+            under += 1
+            who_can_hide[i] = [enumeration.overlay_elements[k] for k in covering[i]]
+        # En WhatsApp el punto de una opción de menú responde el botón de la página que cierra el menú:
+        # un botón DENTRO de capa nunca sale por puntería allí.
+        if partners[i] is not None and not (enumeration.hosted and t.layer >= 0):
+            suspects += 1
+            who_can_hide[i] = (who_can_hide[i] or []) + [targets[j].element for j in partners[i]]
+    work = [i for i in range(len(targets)) if who_can_hide[i] is not None]
+    if not work:
+        return ""
+    summary = f"superposición: {under} botones debajo, puntería: {suspects} sospechosos"
+    if budget < 0.150:
+        return summary + ", sin tiempo antes de dibujar (queda para la comprobación de fondo)"
+    started, checked = time.time(), 0
+    walker = uia.RawViewWalker
+    uc, _ = load_uia()
+    leaving = set()
+    for i in work:
+        if time.time() - started > budget:
+            break
+        checked += 1
+        try:
+            pt = uc.tagPOINT(int(targets[i].point[0]), int(targets[i].point[1]))
+            uia.ElementFromPoint(pt)                 # la primera respuesta de Chromium es aproximada
+            time.sleep(CHECK_WAIT)
+            hit = uia.ElementFromPoint(pt)
+            step_button = step_cover = -1
+            for d in range(40):
+                if not hit:
+                    break
+                if uia.CompareElements(hit, targets[i].element):
+                    step_button = d
+                    break
+                if any(uia.CompareElements(hit, other) for other in who_can_hide[i]):
+                    step_cover = d
+                    break
+                hit = walker.GetParentElement(hit)
+            if br.leaves_by_overlay(step_button, step_cover):
+                leaving.add(i)
+        except Exception:
+            pass   # una pregunta que falla no borra números
+    _drop(enumeration, leaving)
+    return f"{summary}, {checked} comprobados en {int((time.time() - started) * 1000)} ms, {len(leaving)} fuera"
+
+
+def apply_repeated_links(enumeration):
+    """Enlaces a la misma dirección: se queda el primero. SE HACE AL FINAL: después de todo lo que quita
+    números, o un enlace escondido se quedaría con el número y el visible, con la misma dirección, sin ninguno."""
+    leaves = br.repeated_links([t.ctype for t in enumeration.targets], [t.url for t in enumeration.targets])
+    _drop(enumeration, {i for i, gone in enumerate(leaves) if gone})
+    return sum(leaves)
+
+
+def find_ghosts(enumeration, hwnd, started):
+    """Capas, superposiciones y enlaces repetidos sobre una enumeración recién hecha (en el hilo de
+    enumeración, antes de dibujar). Nunca tumba la recogida: un error aquí deja la numeración de siempre."""
+    notes = []
+    try:
+        uc, uia = load_uia()
+        try:
+            note = apply_layers(uia, hwnd, enumeration)
+            if note:
+                notes.append(note)
+        except Exception as exc:
+            notes.append(f"capas: error {exc}")
+        try:
+            left = min(OVERLAP_CAP, ENUM_TOTAL_CAP - (time.time() - started))
+            note = apply_overlaps(uia, enumeration, left)
+            if note:
+                notes.append(note)
+        except Exception as exc:
+            notes.append(f"superposición: error {exc}")
+        try:
+            removed = apply_repeated_links(enumeration)
+            if removed:
+                notes.append(f"enlaces repetidos: {removed} fuera")
+        except Exception:
+            pass
+    except Exception as exc:
+        notes.append(f"fantasmas: error {exc}")
+    enumeration.note = " | ".join(notes)
+
+
+def check_points(enumeration, hwnd, covered, still_current, log=print):
+    """Comprobación de FONDO de los puntos del contenido web, uno a uno. Rellena `covered[i]` (el número
+    se esconde) solo al final y de una vez, y solo si el resultado es plausible: una comprobación que dice
+    "casi todo está cubierto" está rota, no acertada. `still_current()` False = la pantalla cambió."""
+    targets = enumeration.targets
+    checked = covered_count = confirmed = 0
+    started, end, found, examples = time.time(), "completa", [], []
+    precise = None
+    try:
+        uc, uia = load_uia()
+        own_pid = os.getpid()
+        precise = PrecisePoint(uia, hwnd)
+        hosted = enumeration.hosted
+        for i, t in enumerate(targets):
+            if not still_current():
+                end = "interrumpida (la pantalla cambió)"
+                break
+            if time.time() - started > CHECK_CAP:
+                end = f"paró en el tope de {CHECK_CAP:.0f} s"
+                break
+            try:
+                owner = user32.WindowFromPoint(wintypes.POINT(t.point[0], t.point[1]))
+                point_is_ours = bool(owner) and window_pid(owner) == own_pid
+            except Exception:
+                point_is_ours = False
+            if not br.should_check(True, t.is_content, point_is_ours):
+                continue
+            try:
+                c = precise.classify(t.point, t.element, t.rect, own_pid)
+            except Exception:
+                c = "ERROR"
+            # WhatsApp: el punto atraviesa menús y diálogos; un botón DENTRO de capa nunca se borra aquí
+            if (precise.island or hosted) and t.layer >= 0 and c == "COVERED":
+                c = "UNSURE"
+            checked += 1
+            confirmed += c == "OK"
+            if br.number_goes_away(c):
+                found.append(i)
+                if len(examples) < 3:
+                    examples.append(precise.last)
+    except Exception as exc:
+        end = f"error: {exc}"
+    if precise is not None and precise.island:
+        end += " (por MSAA: marco WinUI)"
+    plausible = br.check_is_plausible(checked, len(found), confirmed)
+    applied = 0
+    if plausible and still_current():
+        for i in found:
+            covered[i] = True
+        applied = len(found)
+    log(f"Botones: comprobación {end} -- {checked} de {len(targets)} comprobados en "
+        f"{int((time.time() - started) * 1000)} ms, {confirmed} confirmados en pantalla, {applied} cubiertos escondidos"
+        + ("" if plausible else f" -- DESCARTADA: {len(found)} de {checked} cubiertos no es plausible, no se escondió ningún número")
+        + (f" | en el punto: {' ; '.join(examples)}" if examples else ""))
+    return applied
 
 
 if __name__ == "__main__":   # sonda: python numbered_buttons.py [hwnd]   (sin argumento, la ventana activa)
