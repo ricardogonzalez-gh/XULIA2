@@ -418,6 +418,343 @@ def collect_targets(hwnd, show_close_tab=False):
     return result, ""
 
 
+# --- números hablados ------------------------------------------------------------------------
+
+_UNITS = {
+    "es": {"uno": 1, "un": 1, "dos": 2, "tres": 3, "cuatro": 4, "cinco": 5, "seis": 6, "siete": 7, "ocho": 8, "nueve": 9},
+    "pt": {"um": 1, "uma": 1, "dois": 2, "duas": 2, "tres": 3, "quatro": 4, "cinco": 5, "seis": 6, "sete": 7, "oito": 8, "nove": 9},
+}
+_TEENS = {
+    "diez": 10, "once": 11, "doce": 12, "trece": 13, "catorce": 14, "quince": 15, "dieciseis": 16, "diecisiete": 17,
+    "dieciocho": 18, "diecinueve": 19, "veinte": 20, "veintiuno": 21, "veintiun": 21, "veintidos": 22, "veintitres": 23,
+    "veinticuatro": 24, "veinticinco": 25, "veintiseis": 26, "veintisiete": 27, "veintiocho": 28, "veintinueve": 29,
+    "dez": 10, "onze": 11, "doze": 12, "treze": 13, "quatorze": 14, "quinze": 15, "dezesseis": 16, "dezasseis": 16,
+    "dezessete": 17, "dezassete": 17, "dezoito": 18, "dezenove": 19, "dezanove": 19, "vinte": 20,
+}
+_TENS = {"treinta": 30, "cuarenta": 40, "cincuenta": 50, "sesenta": 60, "setenta": 70, "ochenta": 80, "noventa": 90,
+         "trinta": 30, "quarenta": 40, "cinquenta": 50, "sessenta": 60, "oitenta": 80}
+
+
+def _plain(text):
+    """Minúsculas sin tildes ni eñes."""
+    import unicodedata
+    decomposed = unicodedata.normalize("NFD", text.lower())
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
+_FILLERS = {"numero", "boton", "botao", "el", "la", "o", "a"}
+
+
+def spoken_number(text):
+    """Número del 1 al 99 si la frase ENTERA es un número: cifras ("12"), palabras en español o
+    portugués ("doce", "treinta y cinco", "trinta e cinco"), con "número" o "botón" delante.
+    None en cualquier otro caso: "función cinco" es un comando, no el botón 5."""
+    import re
+    words = [w for w in re.findall(r"[a-z]+|\d+", _plain(text or "")) if w]
+    while words and words[0] in _FILLERS:
+        words = words[1:]
+    units = {**_UNITS["es"], **_UNITS["pt"]}
+    if len(words) == 1:
+        word = words[0]
+        if word.isdigit():
+            return int(word) if 1 <= int(word) <= br.MAX_ELEMENTS else None
+        return _TENS.get(word) or _TEENS.get(word) or units.get(word)
+    if len(words) == 3 and words[0] in _TENS and words[1] in ("y", "e") and words[2] in units:
+        return _TENS[words[0]] + units[words[2]]
+    return None
+
+
+# --- clic -----------------------------------------------------------------------------------
+
+CLICK_PATTERN_TIMEOUT = 1.5   # s: un proveedor colgado no puede congelar el reconocimiento de voz
+_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP = 0x02, 0x04
+_PATTERN_INVOKE, _PATTERN_TOGGLE, _PATTERN_SELECTION_ITEM, _PATTERN_EXPAND_COLLAPSE = 10000, 10015, 10010, 10005
+
+
+def physical_click(point):
+    """Clic físico con pulsación y suelta separadas (un solo mouse_event suele no registrarse en
+    Chrome ni en apps modernas). Exige que la ventana de números deje pasar el ratón."""
+    user32.SetCursorPos(int(point[0]), int(point[1]))
+    time.sleep(0.06)
+    user32.mouse_event(_MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+    time.sleep(0.04)
+    user32.mouse_event(_MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+
+def _act_by_pattern(element):
+    """Invoke, Toggle, Select o Expand/Collapse: lo primero que el elemento admita. False si ninguno."""
+    uc, _ = load_uia()
+
+    def pattern(pattern_id, interface):
+        try:
+            found = element.GetCurrentPattern(pattern_id)
+            return found.QueryInterface(interface) if found else None
+        except Exception:
+            return None
+
+    p = pattern(_PATTERN_INVOKE, uc.IUIAutomationInvokePattern)
+    if p:
+        p.Invoke()
+        return True
+    p = pattern(_PATTERN_TOGGLE, uc.IUIAutomationTogglePattern)
+    if p:
+        p.Toggle()
+        return True
+    p = pattern(_PATTERN_SELECTION_ITEM, uc.IUIAutomationSelectionItemPattern)
+    if p:
+        p.Select()
+        return True
+    p = pattern(_PATTERN_EXPAND_COLLAPSE, uc.IUIAutomationExpandCollapsePattern)
+    if p:
+        if p.CurrentExpandCollapseState == uc.ExpandCollapseState_Expanded:
+            p.Collapse()
+        else:
+            p.Expand()
+        return True
+    return False   # sin patrón: quien llama cae al clic físico
+
+
+def act_by_pattern(element):
+    """_act_by_pattern con tiempo máximo."""
+    import threading
+    box = {}
+
+    def work():
+        try:
+            box["ok"] = _act_by_pattern(element)
+        except Exception:
+            box["ok"] = False
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    worker.join(CLICK_PATTERN_TIMEOUT)
+    return bool(box.get("ok"))
+
+
+# --- la ventana de números ------------------------------------------------------------------
+
+_GWL_EXSTYLE = -20
+# sin foco, fuera de Alt+Tab y que deje pasar el ratón (clic a través)
+_NO_FOCUS_STYLE = 0x00080000 | 0x00000020 | 0x00000080 | 0x08000000
+
+
+def monitor_rect(hwnd):
+    """Rectángulo del monitor donde está la ventana (la ventana de números cubre ese monitor)."""
+    class MonitorInfo(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT), ("rcWork", wintypes.RECT),
+                    ("dwFlags", wintypes.DWORD)]
+    user32.MonitorFromWindow.restype = wintypes.HANDLE
+    user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+    user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
+    info = MonitorInfo()
+    info.cbSize = ctypes.sizeof(MonitorInfo)
+    monitor = user32.MonitorFromWindow(hwnd, 2)   # MONITOR_DEFAULTTONEAREST
+    if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        m = info.rcMonitor
+        return Rect.from_ltrb(m.left, m.top, m.right, m.bottom)
+    return Rect(0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
+
+
+def layout_labels(targets, hidden, sizes):
+    """Posición de cada etiqueta (x, y, ancho, alto) en coordenadas de pantalla, sin solaparse.
+
+    Se ancla en la esquina superior izquierda del ELEMENTO (marca sin ambigüedad cuál es cuál); en
+    elementos anchos (pestañas de 256 px) la esquina queda pegada al vecino de la izquierda y confunde:
+    ahí se ancla en el CENTRO. Si choca con otra etiqueta ya puesta, baja; si no cabe, va a la derecha.
+    `sizes[i]` = (ancho, alto) de la etiqueta i. Los números ocultos (cubiertos) se saltan.
+    """
+    placed, result = [], {}
+    for i, target in enumerate(targets):
+        if i < len(hidden) and hidden[i]:
+            continue
+        w, h = sizes[i]
+        rect = target.rect
+        if rect.width >= 100:
+            x, y = rect.x + rect.width // 2 - w // 2, rect.y + 2
+        else:
+            x, y = rect.x - 2, rect.y - 2
+        candidate = Rect(x, y, w, h)
+        for _ in range(6):
+            if any(o.intersects(candidate) for o in placed):
+                candidate = Rect(candidate.x, candidate.y + h + 2, w, h)
+        for _ in range(6):
+            if any(o.intersects(candidate) for o in placed):
+                candidate = Rect(candidate.x + w + 2, candidate.y, w, h)
+        placed.append(candidate)
+        result[i] = (candidate.x, candidate.y, w, h)
+    return result
+
+
+class NumberOverlay:
+    """Ventana a pantalla completa con los números. Vive en el hilo de Tk de XULIA2: el resto de
+    hilos solo encolan trabajo (`tk_queue`)."""
+
+    def __init__(self, tk_queue, root_getter):
+        self._queue, self._root_getter = tk_queue, root_getter
+        self.window = self.canvas = None
+        self._bounds = Rect()
+
+    def show(self, targets, hidden, bounds):
+        self._queue.put((self._show, (list(targets), list(hidden), bounds), {}))
+
+    def redraw(self, targets, hidden):
+        self._queue.put((self._draw, (list(targets), list(hidden)), {}))
+
+    def hide(self):
+        self._queue.put((self._hide, (), {}))
+
+    # --- lo que sigue corre en el hilo de Tk ---
+    def _show(self, targets, hidden, bounds):
+        import tkinter as tk
+        root = self._root_getter()
+        if root is None:
+            return
+        if self.window is None:
+            win = tk.Toplevel(root)
+            win.withdraw()
+            win.overrideredirect(True)
+            win.attributes("-topmost", True)
+            win.configure(background="#ff00ff")
+            win.attributes("-transparentcolor", "#ff00ff")   # el magenta no se pinta: se ve lo de debajo
+            win.attributes("-alpha", 0.85)
+            self.canvas = tk.Canvas(win, bg="#ff00ff", highlightthickness=0)
+            self.canvas.pack(fill="both", expand=True)
+            self.window = win
+        self._bounds = bounds
+        self.window.geometry(f"{bounds.width}x{bounds.height}+{bounds.x}+{bounds.y}")
+        self.window.update_idletasks()
+        hwnd = user32.GetAncestor(self.window.winfo_id(), 2) or self.window.winfo_id()
+        user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+        user32.SetWindowLongW(hwnd, _GWL_EXSTYLE, user32.GetWindowLongW(hwnd, _GWL_EXSTYLE) | _NO_FOCUS_STYLE)
+        self._draw(targets, hidden)
+        self.window.deiconify()
+
+    def _draw(self, targets, hidden):
+        if self.window is None or self.canvas is None:
+            return
+        import tkinter.font as tkfont
+        font = tkfont.Font(family="Arial", size=11, weight="bold")
+        sizes = [(font.measure(str(i + 1)) + 10, font.metrics("linespace") + 2) for i in range(len(targets))]
+        spots = layout_labels(targets, hidden, sizes)
+        self.canvas.delete("all")
+        for i, (x, y, w, h) in spots.items():
+            x, y = x - self._bounds.x, y - self._bounds.y
+            x = max(0, min(x, self._bounds.width - w))
+            y = max(0, y)
+            self.canvas.create_rectangle(x, y, x + w, y + h, fill="#ffeb3b", outline="black")
+            self.canvas.create_text(x + w // 2, y + h // 2, text=str(i + 1), font=font, fill="black")
+
+    def _hide(self):
+        if self.window is not None:
+            self.window.withdraw()
+            if self.canvas is not None:
+                self.canvas.delete("all")
+
+
+# --- el controlador -------------------------------------------------------------------------
+
+AUTO_HIDE_SECONDS = 45   # red de seguridad: la pantalla nunca se queda con números presos
+
+
+class NumberedButtons:
+    """Enumera, numera y hace clic. No sabe de voz: XULIA2 le pasa el número hablado.
+
+    on_auto_hide() se llama si la ventana de números se apaga sola (45 s): quien escucha tiene que
+    salir del modo, o el usuario seguiría diciendo números que no hacen nada.
+    """
+
+    def __init__(self, tk_queue, root_getter, on_auto_hide=None, log=print):
+        self.overlay = NumberOverlay(tk_queue, root_getter)
+        self.on_auto_hide, self.log = on_auto_hide, log
+        self.enumeration = None
+        self.covered = []
+        self.reason = ""          # por qué show() devolvió 0 (va al registro)
+        self.active = False
+        self._timer = None
+
+    @property
+    def targets(self):
+        return self.enumeration.targets if self.enumeration else []
+
+    def show(self):
+        """Numera la ventana en primer plano. Devuelve cuántos elementos numeró (0 = nada o error)."""
+        self.reason = ""
+        hwnd = user32.GetForegroundWindow()
+        result, why = collect_targets(hwnd)
+        # Chromium solo construye el árbol de accesibilidad de la página cuando nota un cliente, y la
+        # PRIMERA consulta suele traer solo el marco del navegador: se reintenta hasta 2 veces.
+        if result is not None and class_name(hwnd) == "Chrome_WidgetWin_1":
+            for _ in range(2):
+                if any(target.is_content for target in result.targets):
+                    break
+                time.sleep(0.5)
+                again, _why = collect_targets(hwnd)
+                if again is not None:
+                    result = again
+        if result is None:
+            self.reason = why
+            self.log(f"Botones: sin números ({why})")
+            self.hide()
+            return 0
+        self.enumeration, self.covered, self.active = result, [False] * len(result.targets), True
+        self.overlay.show(result.targets, self.covered, monitor_rect(hwnd))
+        self._restart_timer()
+        self.log(f"Botones: {len(result.targets)} numerados en {result.elapsed:.2f} s ({result.visited} nodos)")
+        return len(result.targets)
+
+    def is_covered(self, number):
+        return 1 <= number <= len(self.covered) and self.covered[number - 1]
+
+    def click(self, number):
+        """Hace clic en el elemento `number`. True solo si lo consiguió (entonces se sigue en el modo)."""
+        targets = self.targets
+        if not 1 <= number <= len(targets):
+            self.reason = f"el número {number} no existe (hay {len(targets)})"
+            return False
+        if self.is_covered(number):
+            self.reason = f"el número {number} estaba cubierto por otra cosa"
+            return False
+        target = targets[number - 1]
+        # contenido web: el Invoke de UIA muchas veces no dispara el manejador de clic de la página,
+        # así que va PRIMERO el clic físico. App nativa: el patrón UIA es más preciso e ignora lo que
+        # tape o dónde esté el cursor, y el clic físico queda de refuerzo.
+        try:
+            if target.is_content:
+                physical_click(target.point)
+                return True
+            if act_by_pattern(target.element):
+                return True
+            physical_click(target.point)
+            return True
+        except Exception as exc:
+            self.reason = f"error al hacer clic: {exc}"
+            return False
+
+    def hide(self):
+        self.active = False
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        self.overlay.hide()
+
+    def _restart_timer(self):
+        import threading
+        if self._timer is not None:
+            self._timer.cancel()
+        self._timer = threading.Timer(AUTO_HIDE_SECONDS, self._auto_hide)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _auto_hide(self):
+        self.hide()
+        if self.on_auto_hide:
+            try:
+                self.on_auto_hide()
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":   # sonda: python numbered_buttons.py [hwnd]   (sin argumento, la ventana activa)
     import sys
     handle = int(sys.argv[1], 0) if len(sys.argv) > 1 else user32.GetForegroundWindow()
