@@ -191,11 +191,13 @@ class _Node:
 
 class Target:
     """Un elemento numerable y lo que las fases siguientes necesitan saber de él."""
-    __slots__ = ("element", "point", "rect", "ctype", "is_content", "layer", "overlay", "doc", "serial", "url")
+    __slots__ = ("element", "point", "rect", "ctype", "is_content", "layer", "overlay", "doc", "serial", "url",
+                 "interactive")
 
     def __init__(self, element, point, rect, ctype, is_content, layer, overlay, doc, serial, url):
         self.element, self.point, self.rect, self.ctype = element, point, rect, ctype
         self.is_content, self.layer, self.overlay, self.doc, self.serial, self.url = is_content, layer, overlay, doc, serial, url
+        self.interactive = False
 
 
 class Enumeration:
@@ -810,28 +812,30 @@ def _search_by_name(hwnd, area, wanted):
             visited += 1
             try:
                 ctype = child.CachedControlType
-                if ctype not in (br.TITLEBAR, br.MENUBAR, br.SCROLLBAR):
-                    rect = _cached_rect(child)
-                    rect_valid = rect.width > 1 and rect.height > 1
-                    if not rect_valid or rect.intersects(area):
-                        name = child.CachedName or ""
-                        cx, cy = rect.x + rect.width // 2, rect.y + rect.height // 2
-                        if (rect_valid and name.strip() and not br.is_caption_name(name)
-                                and br.is_interactive(ctype, bool(child.CachedIsKeyboardFocusable))
-                                and child.CachedIsEnabled and not child.CachedIsOffscreen
-                                and area.contains_point(cx, cy)
-                                and not br.is_duplicate(seen_points, seen_names, (cx, cy), name)):
-                            hit = None
-                            if br.name_matches(name, wanted):
-                                hit = exact
-                            elif br.name_matches(name, "*" + wanted):
-                                hit = contains
-                            if hit is not None:
-                                seen_points.append((cx, cy))
-                                seen_names.append(name)
-                                hit.append(Target(child, (cx, cy), rect, ctype, node.in_doc or ctype == br.DOCUMENT,
-                                                  -1, -1, -1, -1, ""))
-                        queue.append(_Node(child, node.in_tab, node.in_doc or ctype == br.DOCUMENT))
+                rect = _cached_rect(child)
+                rect_valid = rect.width > 1 and rect.height > 1
+                if not rect_valid or rect.intersects(area):
+                    name = child.CachedName or ""
+                    cx, cy = rect.x + rect.width // 2, rect.y + rect.height // 2
+                    # como en la 1.5 (BuscarPorNombre): cualquier elemento con nombre, visible, habilitado y
+                    # dentro de la ventana; aquí NO se poda ningún tipo (la barra de menús guarda "Archivo",
+                    # "Editar"...) ni se exige que sea interactivo: eso solo desempata más abajo
+                    if (rect_valid and name.strip() and child.CachedIsEnabled and not child.CachedIsOffscreen
+                            and area.contains_point(cx, cy)
+                            and not br.is_duplicate(seen_points, seen_names, (cx, cy), name)):
+                        hit = None
+                        if br.name_matches(name, wanted):
+                            hit = exact
+                        elif br.name_matches(name, "*" + wanted):
+                            hit = contains
+                        if hit is not None:
+                            seen_points.append((cx, cy))
+                            seen_names.append(name)
+                            target = Target(child, (cx, cy), rect, ctype, node.in_doc or ctype == br.DOCUMENT,
+                                            -1, -1, -1, -1, "")
+                            target.interactive = br.is_interactive(ctype, bool(child.CachedIsKeyboardFocusable))
+                            hit.append(target)
+                    queue.append(_Node(child, node.in_tab, node.in_doc or ctype == br.DOCUMENT))
             except Exception:
                 pass
             child = _next(walker, child, cache)
@@ -897,6 +901,11 @@ def click_by_name(name):
             break
         time.sleep(0.5)
     candidates = exact or contains
+    if len(candidates) > 1:
+        # un texto "Archivo" junto al botón "Archivo" no es ambigüedad: se prefieren los clicables
+        clickable = [c for c in candidates if c.interactive]
+        if clickable:
+            candidates = clickable
     if not candidates:
         return "none", None
     if len(candidates) > 1:
