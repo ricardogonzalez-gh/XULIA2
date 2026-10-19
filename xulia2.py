@@ -473,7 +473,7 @@ class VoiceControlAssistant:
         self._correction_active_index = 0
         self._correction_target = None
         self._start_tk_thread()
-        # Status strip: current mode, last command understood and, per mode, how to act / leave.
+        # Franja de estado: modo actual, último comando entendido y, según el modo, cómo actuar y salir.
         self._panel_last = None
         self.status_panel = None
         if panel_enabled():
@@ -1002,7 +1002,7 @@ class VoiceControlAssistant:
         return image
 
     def _panel_state(self):
-        """(mode, language, last) for the status panel; called from the Tk thread."""
+        """(modo, idioma, último) para el panel de estado; se llama desde el hilo de Tk."""
         mode = mode_from_state(
             active=getattr(self, 'active', True),
             paused=time.time() < getattr(self, 'silenced_until', 0),
