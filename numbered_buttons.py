@@ -471,14 +471,42 @@ _MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP = 0x02, 0x04
 _PATTERN_INVOKE, _PATTERN_TOGGLE, _PATTERN_SELECTION_ITEM, _PATTERN_EXPAND_COLLAPSE = 10000, 10015, 10010, 10005
 
 
+class _MouseInput(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _Input(ctypes.Structure):
+    class _Union(ctypes.Union):
+        _fields_ = [("mi", _MouseInput)]
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", _Union)]
+
+
+_MOVE, _ABSOLUTE, _VIRTUALDESK = 0x0001, 0x8000, 0x4000
+
+
+def _send_mouse(point, button_flag):
+    """Un evento de ratón en una posición ABSOLUTA: el evento lleva su propia posición, así que cae en el
+    punto aunque el puntero se esté moviendo (ratón de cabeza, otro dispositivo)."""
+    left, top = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)      # SM_XVIRTUALSCREEN / YVIRTUALSCREEN
+    width, height = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)  # SM_CXVIRTUALSCREEN / CYVIRTUALSCREEN
+    nx = int((point[0] - left) * 65535 / max(1, width - 1))
+    ny = int((point[1] - top) * 65535 / max(1, height - 1))
+    event = _Input(type=0, mi=_MouseInput(nx, ny, 0, _MOVE | _ABSOLUTE | _VIRTUALDESK | button_flag, 0, 0))
+    user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(_Input))
+
+
 def physical_click(point):
-    """Clic físico con pulsación y suelta separadas (un solo mouse_event suele no registrarse en
-    Chrome ni en apps modernas). Exige que la ventana de números deje pasar el ratón."""
-    user32.SetCursorPos(int(point[0]), int(point[1]))
+    """Clic físico con pulsación y suelta separadas (un solo evento suele no registrarse en Chrome ni en
+    apps modernas), cada una con la posición absoluta del punto. Exige que la ventana de números deje
+    pasar el ratón."""
+    point = (int(point[0]), int(point[1]))
+    _send_mouse(point, 0)
     time.sleep(0.06)
-    user32.mouse_event(_MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+    _send_mouse(point, _MOUSEEVENTF_LEFTDOWN)
     time.sleep(0.04)
-    user32.mouse_event(_MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+    _send_mouse(point, _MOUSEEVENTF_LEFTUP)
 
 
 def _act_by_pattern(element):
@@ -720,12 +748,7 @@ class NumberedButtons:
         # así que va PRIMERO el clic físico. App nativa: el patrón UIA es más preciso e ignora lo que
         # tape o dónde esté el cursor, y el clic físico queda de refuerzo.
         try:
-            if target.is_content:
-                physical_click(target.point)
-                return True
-            if act_by_pattern(target.element):
-                return True
-            physical_click(target.point)
+            click_element(target.element, target.point, target.is_content)
             return True
         except Exception as exc:
             self.reason = f"error al hacer clic: {exc}"
@@ -753,6 +776,146 @@ class NumberedButtons:
                 self.on_auto_hide()
             except Exception:
                 pass
+
+
+# --- clic por nombre ("botón guardar") --------------------------------------------------------
+# Adaptado de BuscarPorNombre / ClicarPorNome de la 1.5. Aquí se busca en la ventana activa (y en sus
+# ventanas de render) un elemento clicable cuyo nombre accesible coincida, sin mayúsculas ni acentos,
+# y se hace clic SOLO si hay uno. Un clic equivocado en "Cerrar" o "Eliminar" es peor que no hacer
+# nada: con varios candidatos se avisa y se deja que el usuario elija con los números.
+
+def _search_by_name(hwnd, area, wanted):
+    """Elementos clicables visibles de la ventana cuyo nombre es `wanted`: (exactos, que lo contienen)."""
+    uc, uia = load_uia()
+    cache = _make_cache(uia)
+    walker = uia.RawViewWalker
+    queue = collections.deque()
+    queue.append(_Node(uia.ElementFromHandleBuildCache(hwnd, cache)))
+    for hr in render_windows(hwnd):
+        try:
+            el = uia.ElementFromHandleBuildCache(hr, cache)
+            if el:
+                queue.append(_Node(el, in_doc=True))
+        except Exception:
+            pass
+    exact, contains, seen_points, seen_names = [], [], [], []
+    started, visited = time.time(), 0
+    while queue and time.time() - started < BFS_BUDGET and visited < MAX_NODES:
+        node = queue.popleft()
+        try:
+            child = walker.GetFirstChildElementBuildCache(node.el, cache)
+        except Exception:
+            continue
+        while child and time.time() - started < BFS_BUDGET and visited < MAX_NODES:
+            visited += 1
+            try:
+                ctype = child.CachedControlType
+                if ctype not in (br.TITLEBAR, br.MENUBAR, br.SCROLLBAR):
+                    rect = _cached_rect(child)
+                    rect_valid = rect.width > 1 and rect.height > 1
+                    if not rect_valid or rect.intersects(area):
+                        name = child.CachedName or ""
+                        cx, cy = rect.x + rect.width // 2, rect.y + rect.height // 2
+                        if (rect_valid and name.strip() and not br.is_caption_name(name)
+                                and br.is_interactive(ctype, bool(child.CachedIsKeyboardFocusable))
+                                and child.CachedIsEnabled and not child.CachedIsOffscreen
+                                and area.contains_point(cx, cy)
+                                and not br.is_duplicate(seen_points, seen_names, (cx, cy), name)):
+                            hit = None
+                            if br.name_matches(name, wanted):
+                                hit = exact
+                            elif br.name_matches(name, "*" + wanted):
+                                hit = contains
+                            if hit is not None:
+                                seen_points.append((cx, cy))
+                                seen_names.append(name)
+                                hit.append(Target(child, (cx, cy), rect, ctype, node.in_doc or ctype == br.DOCUMENT,
+                                                  -1, -1, -1, -1, ""))
+                        queue.append(_Node(child, node.in_tab, node.in_doc or ctype == br.DOCUMENT))
+            except Exception:
+                pass
+            child = _next(walker, child, cache)
+    return exact, contains
+
+
+def click_element(element, point, is_content, restore_cursor=False):
+    """Hace clic en un elemento. Contenido web: clic físico primero; app nativa: patrón UIA primero.
+    Con restore_cursor el puntero vuelve a donde estaba (quien apunta con la cabeza no lo pierde)."""
+    class Point(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+    before = Point()
+    user32.GetCursorPos(ctypes.byref(before))
+    try:
+        if is_content:
+            physical_click(point)
+            return True
+        if act_by_pattern(element):
+            return True
+        physical_click(point)
+        return True
+    finally:
+        if restore_cursor:
+            time.sleep(0.1)
+            user32.SetCursorPos(before.x, before.y)
+
+
+def click_by_name(name):
+    """Hace clic en el elemento clicable llamado `name` de la ventana activa.
+
+    Devuelve (estado, detalle): ("clicked", nombre) | ("none", None) | ("ambiguous", [nombres])
+    | ("error", motivo). Exactos primero; si no hay ninguno, los que contienen el nombre.
+    """
+    import threading
+    name = (name or "").strip()
+    if not name:
+        return "error", "sin nombre"
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return "error", "sin ventana en primer plano"
+    if window_pid(hwnd) == os.getpid():
+        return "error", "la ventana activa es el propio XULIA2"
+    area = window_rect(hwnd)
+    box = {}
+
+    def work():
+        try:
+            box["found"] = _search_by_name(hwnd, area, name)
+        except Exception as exc:
+            box["error"] = f"{type(exc).__name__}: {exc}"
+
+    for attempt in range(2):   # Chromium: la primera consulta puede traer solo el marco
+        box.clear()
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        worker.join(ENUM_TIMEOUT)
+        if worker.is_alive():
+            return "error", "tiempo agotado buscando el elemento"
+        if "error" in box:
+            return "error", box["error"]
+        exact, contains = box["found"]
+        if (exact or contains) or class_name(hwnd) != "Chrome_WidgetWin_1":
+            break
+        time.sleep(0.5)
+    candidates = exact or contains
+    if not candidates:
+        return "none", None
+    if len(candidates) > 1:
+        names = []
+        for c in candidates:
+            try:
+                names.append(c.element.CachedName)
+            except Exception:
+                names.append(name)
+        return "ambiguous", names
+    target = candidates[0]
+    try:
+        click_element(target.element, target.point, target.is_content, restore_cursor=True)
+    except Exception as exc:
+        return "error", f"{type(exc).__name__}: {exc}"
+    try:
+        return "clicked", target.element.CachedName
+    except Exception:
+        return "clicked", name
 
 
 if __name__ == "__main__":   # sonda: python numbered_buttons.py [hwnd]   (sin argumento, la ventana activa)

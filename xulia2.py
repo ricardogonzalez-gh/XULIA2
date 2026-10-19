@@ -40,7 +40,7 @@ from collections import OrderedDict
 from status_panel import StatusPanel, mode_from_state, panel_enabled
 import webbrowser
 import tempfile
-from numbered_buttons import NumberedButtons, spoken_number
+from numbered_buttons import NumberedButtons, click_by_name, spoken_number
 
 # Números en portugués; se suman a las tablas de números de más abajo, que son del español.
 NUMEROS_PT = {
@@ -2715,31 +2715,54 @@ class VoiceControlAssistant:
         except Exception:
             return False
 
+    # --- Clic por nombre: "botón guardar", "clicar em salvar", "opción menú archivo" ---
+    # Busca en la ventana activa un elemento clicable con ese nombre (sin mayúsculas ni acentos) y hace
+    # clic SOLO si hay uno. Antes estos comandos solo movían el ratón hasta el botón.
+    _CLICK_WORDS = re.compile(r"\b(bot[oó]n|bot[oõ]es|bot[aã]o|clicar|clic|clique|pulsar|press|sobre|hacer|fazer|"
+                              r"opci[oó]n|op[cç][aã]o|men[uú])\b", re.I)
+
+    def _name_to_click(self, phrase):
+        """Quita las palabras de mando y las preposiciones del principio: "clicar em salvar" -> "salvar"."""
+        words = self._CLICK_WORDS.sub(" ", phrase or "").strip()
+        while True:
+            shorter = re.sub(r"^(?:en|em|no|na|el|la|o|a|do|da|de)\s+", "", words, flags=re.I)
+            if shorter == words:
+                return words.strip()
+            words = shorter
+
+    def _click_by_name(self, name):
+        name = self._name_to_click(name)
+        if not name:
+            self.notify("No se detectó nombre de botón")
+            return True
+        status, detail = click_by_name(name)
+        if status == "clicked":
+            self.notify(f"Clic en «{detail}»", toast=False)
+        elif status == "none":
+            self.notify(f"No encontré «{name}» en esta ventana")
+        elif status == "ambiguous":
+            self.notify(f"Hay {len(detail)} elementos llamados «{name}»: di «botones» y elige por número")
+        else:
+            self.notify(f"No pude hacer clic en «{name}»: {detail}")
+        return True
+
     def _handle_named_button(self, match, text, normalized):
         try:
-            name = match.group(1).strip()
-            if name:
-                self._move_to_named_button(name)
-                return True
-        except Exception:
-            pass
-        return False
+            return self._click_by_name(match.group(1))
+        except Exception as exc:
+            print("Error en el clic por nombre:", exc)
+            traceback.print_exc()
+            return False
 
     def _handle_named_menu(self, match, text, normalized):
-        try:
-            name = match.group(1).strip()
-            if name:
-                self._move_to_named_menu(name)
-                return True
-        except Exception:
-            pass
-        return False
+        return self._handle_named_button(match, text, normalized)
 
     def _handle_click_button(self, match, text, normalized):
         try:
-            self._click_named_button(normalized)
-            return True
-        except Exception:
+            return self._click_by_name(normalized)
+        except Exception as exc:
+            print("Error en el clic por nombre:", exc)
+            traceback.print_exc()
             return False
 
     def _handle_borrar_palabra(self, match, text, normalized):
