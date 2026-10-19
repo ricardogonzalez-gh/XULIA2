@@ -471,14 +471,42 @@ _MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP = 0x02, 0x04
 _PATTERN_INVOKE, _PATTERN_TOGGLE, _PATTERN_SELECTION_ITEM, _PATTERN_EXPAND_COLLAPSE = 10000, 10015, 10010, 10005
 
 
+class _MouseInput(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _Input(ctypes.Structure):
+    class _Union(ctypes.Union):
+        _fields_ = [("mi", _MouseInput)]
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", _Union)]
+
+
+_MOVE, _ABSOLUTE, _VIRTUALDESK = 0x0001, 0x8000, 0x4000
+
+
+def _send_mouse(point, button_flag):
+    """Un evento de ratón en una posición ABSOLUTA: el evento lleva su propia posición, así que cae en el
+    punto aunque el puntero se esté moviendo (ratón de cabeza, otro dispositivo)."""
+    left, top = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)      # SM_XVIRTUALSCREEN / YVIRTUALSCREEN
+    width, height = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)  # SM_CXVIRTUALSCREEN / CYVIRTUALSCREEN
+    nx = int((point[0] - left) * 65535 / max(1, width - 1))
+    ny = int((point[1] - top) * 65535 / max(1, height - 1))
+    event = _Input(type=0, mi=_MouseInput(nx, ny, 0, _MOVE | _ABSOLUTE | _VIRTUALDESK | button_flag, 0, 0))
+    user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(_Input))
+
+
 def physical_click(point):
-    """Clic físico con pulsación y suelta separadas (un solo mouse_event suele no registrarse en
-    Chrome ni en apps modernas). Exige que la ventana de números deje pasar el ratón."""
-    user32.SetCursorPos(int(point[0]), int(point[1]))
+    """Clic físico con pulsación y suelta separadas (un solo evento suele no registrarse en Chrome ni en
+    apps modernas), cada una con la posición absoluta del punto. Exige que la ventana de números deje
+    pasar el ratón."""
+    point = (int(point[0]), int(point[1]))
+    _send_mouse(point, 0)
     time.sleep(0.06)
-    user32.mouse_event(_MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+    _send_mouse(point, _MOUSEEVENTF_LEFTDOWN)
     time.sleep(0.04)
-    user32.mouse_event(_MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+    _send_mouse(point, _MOUSEEVENTF_LEFTUP)
 
 
 def _act_by_pattern(element):
