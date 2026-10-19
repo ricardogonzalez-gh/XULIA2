@@ -52,5 +52,24 @@ class LayoutLabels(unittest.TestCase):
         self.assertEqual(list(spots), [1])
 
 
+class ShowPattern(unittest.TestCase):
+    """La palabra suelta "botones"/"botões" abre (o renueva) el modo; con un nombre detrás es otro comando."""
+
+    def setUp(self):
+        import re
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "patterns.txt")
+        with open(path, encoding="utf-8") as fh:
+            line = next(l for l in fh if l.startswith("buttons_show="))
+        self.pattern = re.compile(line.split("=", 1)[1].strip(), re.I)
+
+    def test_bare_word_and_phrases(self):
+        for text in ("botones", "botões", "Botões", "mostrar botones", "mostrar botónes"):
+            self.assertTrue(self.pattern.search(text), text)
+
+    def test_with_a_name_it_is_not_show(self):
+        for text in ("botón guardar", "botões salvar", "clicar botões", "cancelar"):
+            self.assertFalse(self.pattern.search(text), text)
+
+
 if __name__ == "__main__":
     unittest.main()

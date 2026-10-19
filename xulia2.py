@@ -2546,6 +2546,8 @@ class VoiceControlAssistant:
         normal como cualquier otro comando.
         """
         # decir "mostrar botones" otra vez renumera (la pantalla pudo cambiar)
+        # (incluye la palabra suelta "botones"/"botões", el gatillo de la 1.5: antes caía en el comando
+        # click_button y SACABA del modo)
         show_pattern = self.commands.get("buttons_show")
         if show_pattern and show_pattern.search(stripped):
             self._handle_buttons_show(None, stripped, stripped.lower())
