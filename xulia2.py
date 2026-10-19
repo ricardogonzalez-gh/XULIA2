@@ -17,7 +17,14 @@ from PIL import Image, ImageDraw
 import pyperclip
 from pywinauto import Desktop
 try:
-    from win10toast import ToastNotifier
+    from win10toast import ToastNotifier as _Win10Toast
+
+    class ToastNotifier(_Win10Toast):
+        # win10toast 0.9 returns None from on_destroy; recent pywin32 requires an int
+        # from the window procedure ("WPARAM is simple, so must be an int object").
+        def on_destroy(self, hwnd, msg, wparam, lparam):
+            _Win10Toast.on_destroy(self, hwnd, msg, wparam, lparam)
+            return 0
 except Exception:
     # If pkg_resources (setuptools) is missing or win10toast cannot be imported,
     # provide a minimal fallback that prints messages to console so the
@@ -248,9 +255,9 @@ class GridOverlay:
 
         text = "Rejilla 20x15 activada: di 'casilla N' o 'celda N' para mover y hacer clic"
         canvas.create_text(screen_width // 2, 30, text=text, fill="white", font=("Arial", 16, "bold"))
-        root.deiconify()
-        root.lift()
-        root.update_idletasks()
+        self.root.deiconify()
+        self.root.lift()
+        self.root.update_idletasks()
 
         # If `hide()` was called while the overlay thread was still initializing
         # (i.e. before entering mainloop), abort showing the window.
