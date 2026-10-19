@@ -20,8 +20,8 @@ try:
     from win10toast import ToastNotifier as _Win10Toast
 
     class ToastNotifier(_Win10Toast):
-        # win10toast 0.9 returns None from on_destroy; recent pywin32 requires an int
-        # from the window procedure ("WPARAM is simple, so must be an int object").
+        # win10toast 0.9 devuelve None desde on_destroy; pywin32 reciente exige un entero
+        # en el procedimiento de ventana ("WPARAM is simple, so must be an int object").
         def on_destroy(self, hwnd, msg, wparam, lparam):
             _Win10Toast.on_destroy(self, hwnd, msg, wparam, lparam)
             return 0
