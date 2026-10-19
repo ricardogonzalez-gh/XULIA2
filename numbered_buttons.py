@@ -963,6 +963,12 @@ def click_by_name(name):
 # Todo se queda del lado de MANTENER números: un error o una respuesta dudosa nunca borran uno.
 
 CHECK_WAIT = 0.010        # s entre la 1ª y la 2ª pregunta del punto
+# Quitar un número es lo único irreversible a la vista del usuario, y la respuesta de Chromium sobre
+# un punto OSCILA (medido en un menú abierto: la 1.5 también pierde a veces opciones visibles). Por eso
+# "cubierto" solo vale si se repite en CONFIRM_ASKS preguntas seguidas; una sola respuesta distinta
+# basta para dejar el número. Con 1 se obtiene el comportamiento exacto de la 1.5.
+CONFIRM_ASKS = int(os.environ.get("XULIA2_CONFIRM_ASKS", "3"))
+CONFIRM_GAP = 0.015       # s entre una pregunta y su confirmación
 CHECK_CAP = 8.0           # s: tope de la comprobación de fondo
 LAYERS_CAP = 0.7          # s: tope de las capas (antes de dibujar)
 OVERLAP_CAP = 1.2         # s: tope de las superposiciones (antes de dibujar)
@@ -995,7 +1001,13 @@ class PrecisePoint:
             hit = self.uia.ElementFromPoint(pt)
             if not self._is_winui_frame(hit):
                 self.last = self._describe(hit, own_pid)
-                return self._classify_uia(hit, element)
+                verdict = self._classify_uia(hit, element)
+                for _ in range(CONFIRM_ASKS - 1):
+                    if verdict != "COVERED":
+                        break   # una sola respuesta distinta basta: el número se queda
+                    time.sleep(CONFIRM_GAP)
+                    verdict = self._classify_uia(self.uia.ElementFromPoint(pt), element)
+                return verdict
             self.island = True
         return self._classify_msaa(point, rect, layer_rect, insist)
 
@@ -1243,18 +1255,27 @@ def apply_overlaps(uia, enumeration, budget):
             uia.ElementFromPoint(pt)                 # la primera respuesta de Chromium es aproximada
             time.sleep(CHECK_WAIT)
             hit = uia.ElementFromPoint(pt)
-            step_button = step_cover = -1
-            for d in range(40):
-                if not hit:
-                    break
-                if uia.CompareElements(hit, targets[i].element):
-                    step_button = d
-                    break
-                if any(uia.CompareElements(hit, other) for other in who_can_hide[i]):
-                    step_cover = d
-                    break
-                hit = walker.GetParentElement(hit)
-            if br.leaves_by_overlay(step_button, step_cover):
+            decisions = 0
+            for ask in range(CONFIRM_ASKS):
+                if ask:
+                    time.sleep(CONFIRM_GAP)
+                    hit = uia.ElementFromPoint(pt)
+                step_button = step_cover = -1
+                probe = hit
+                for d in range(40):
+                    if not probe:
+                        break
+                    if uia.CompareElements(probe, targets[i].element):
+                        step_button = d
+                        break
+                    if any(uia.CompareElements(probe, other) for other in who_can_hide[i]):
+                        step_cover = d
+                        break
+                    probe = walker.GetParentElement(probe)
+                if not br.leaves_by_overlay(step_button, step_cover):
+                    break   # una sola respuesta distinta basta: el número se queda
+                decisions += 1
+            if decisions == CONFIRM_ASKS:
                 leaving.add(i)
         except Exception:
             pass   # una pregunta que falla no borra números
