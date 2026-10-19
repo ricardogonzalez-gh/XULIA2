@@ -25,6 +25,10 @@ BFS_BUDGET = 3.0          # s: presupuesto interno de la búsqueda
 MAX_NODES = 5000          # tope de nodos recorridos (apps web enormes)
 ENUM_TIMEOUT = 4.0        # s: tope duro del hilo de enumeración
 BAND_TOP_PX = 46          # franja superior donde vive el marco de la ventana
+# Con el tope de 99 y "contenido primero" (como en la 1.5), una página con mucho contenido se lleva los
+# 99 números y las pestañas y la barra de favoritos del navegador se quedan sin ninguno. Se reservan
+# hasta CHROME_RESERVE números para el marco SOLO cuando no cabe todo; con 0 se obtiene la 1.5 exacta.
+CHROME_RESERVE = int(os.environ.get("XULIA2_CHROME_RESERVE", "15"))
 
 # propiedades UIA que se piden en la caché (una sola llamada entre procesos por elemento)
 _P_RECT, _P_PID, _P_TYPE, _P_NAME, _P_FOCUSABLE, _P_ENABLED = 30001, 30002, 30003, 30005, 30009, 30010
@@ -372,13 +376,13 @@ def enumerate_targets(hwnd, area, show_close_tab=False):
 
     # salida CONTENIDO-PRIMERO; el marco (barra de herramientas, menú) con elementos numerados dentro
     # se queda fuera (regla B)
-    for group in (content, chrome):
-        for target in group:
-            if len(out.targets) >= br.MAX_ELEMENTS:
-                break
-            if br.frame_with_numbered_items(target.ctype, target.serial in with_numbered_item):
-                continue
-            out.targets.append(target)
+    content_ok = [x for x in content if not br.frame_with_numbered_items(x.ctype, x.serial in with_numbered_item)]
+    chrome_ok = [x for x in chrome if not br.frame_with_numbered_items(x.ctype, x.serial in with_numbered_item)]
+    room = br.MAX_ELEMENTS
+    if len(content_ok) + len(chrome_ok) > room:   # no cabe todo: el marco conserva su reserva
+        room -= min(len(chrome_ok), CHROME_RESERVE)
+    out.targets = content_ok[:room]
+    out.targets += chrome_ok[:br.MAX_ELEMENTS - len(out.targets)]
     out.visited = visited
     find_ghosts(out, hwnd, started)   # capas, superposiciones y enlaces repetidos, antes de dibujar
     out.elapsed = time.time() - started
