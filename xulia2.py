@@ -33,7 +33,7 @@ from collections import OrderedDict
 import webbrowser
 import tempfile
 
-# Portuguese number words; merged into the number tables below, which are Spanish-based.
+# Números en portugués; se suman a las tablas de números de más abajo, que son del español.
 NUMEROS_PT = {
     'zero': 0, 'um': 1, 'uma': 1, 'dois': 2, 'duas': 2, 'três': 3, 'quatro': 4, 'cinco': 5,
     'seis': 6, 'sete': 7, 'oito': 8, 'nove': 9, 'dez': 10, 'onze': 11, 'doze': 12,
@@ -44,18 +44,18 @@ NUMEROS_PT = {
     'vinte e sete': 27, 'vinte e oito': 28, 'vinte e nove': 29, 'trinta': 30,
 }
 
-# Languages with a patterns.<code>.txt next to patterns.txt (Spanish is patterns.txt itself).
+# Idiomas con un patterns.<código>.txt junto a patterns.txt (el español es el propio patterns.txt).
 SUPPORTED_LANGUAGES = {'es': 'es-ES', 'pt': 'pt-BR'}
 
 
 def _normalize_language(code):
-    """'pt', 'pt_BR', 'PT-br' -> 'pt-BR'; None if empty or not supported."""
+    """'pt', 'pt_BR', 'PT-br' -> 'pt-BR'; None si está vacío o no está soportado."""
     prefix = (code or '').strip().replace('_', '-').split('-')[0].lower()
     return SUPPORTED_LANGUAGES.get(prefix)
 
 
 def _windows_language():
-    """Primary language of the Windows display language ('pt', 'es' or '')."""
+    """Idioma principal de la interfaz de Windows ('pt', 'es' o '')."""
     try:
         langid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
     except Exception:
@@ -64,10 +64,10 @@ def _windows_language():
 
 
 def resolve_language(requested=None):
-    """Pick the language: argument, then %APPDATA%\\Xulia2\\config.ini, then Windows, then es-ES.
+    """Elige el idioma: argumento, luego %APPDATA%\\Xulia2\\config.ini, luego Windows y, por defecto, es-ES.
 
-    config.ini is read from the user's profile (not the program folder, which an installer
-    replaces and may leave read-only): [general] idioma = pt-BR
+    config.ini se lee del perfil del usuario (no de la carpeta del programa, que el instalador
+    reemplaza y puede ser de solo lectura): [general] idioma = pt-BR
     """
     user_value = ''
     try:
@@ -582,7 +582,7 @@ class VoiceControlAssistant:
         return None
 
     def _language_patterns_path(self):
-        """patterns.<language>.txt next to patterns.txt, or None to use patterns.txt (Spanish)."""
+        """patterns.<idioma>.txt junto a patterns.txt, o None para usar patterns.txt (español)."""
         path = os.path.join(os.path.dirname(__file__), f"patterns.{self.language}.txt")
         return path if os.path.exists(path) else None
 
@@ -595,8 +595,8 @@ class VoiceControlAssistant:
             # read raw config values to pick up non-regex settings like vosk_language
             config_vals = self._read_config_values(base_path)
             if lang_path:
-                # the language file overrides language-specific values (prefixes, literal word);
-                # the recognizer language comes from the selection, not from the file
+                # el archivo de idioma pisa los valores propios del idioma (prefijos, palabra literal);
+                # el idioma del reconocedor sale de la elección, no del archivo
                 config_vals.update(self._read_config_values(lang_path))
             if config_vals:
                 # allow config to override recognizer language for Vosk
