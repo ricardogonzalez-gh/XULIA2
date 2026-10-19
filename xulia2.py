@@ -20,8 +20,8 @@ try:
     from win10toast import ToastNotifier as _Win10Toast
 
     class ToastNotifier(_Win10Toast):
-        # win10toast 0.9 returns None from on_destroy; recent pywin32 requires an int
-        # from the window procedure ("WPARAM is simple, so must be an int object").
+        # win10toast 0.9 devuelve None desde on_destroy; pywin32 reciente exige un entero
+        # en el procedimiento de ventana ("WPARAM is simple, so must be an int object").
         def on_destroy(self, hwnd, msg, wparam, lparam):
             _Win10Toast.on_destroy(self, hwnd, msg, wparam, lparam)
             return 0
@@ -534,7 +534,7 @@ class VoiceControlAssistant:
         self._correction_active_index = 0
         self._correction_target = None
         self._start_tk_thread()
-        # Status strip: current mode, last command understood and, per mode, how to act / leave.
+        # Franja de estado: modo actual, último comando entendido y, según el modo, cómo actuar y salir.
         self._panel_last = None
         self.status_panel = None
         if panel_enabled():
@@ -1074,7 +1074,7 @@ class VoiceControlAssistant:
         return image
 
     def _panel_state(self):
-        """(mode, language, last) for the status panel; called from the Tk thread."""
+        """(modo, idioma, último) para el panel de estado; se llama desde el hilo de Tk."""
         mode = mode_from_state(
             active=getattr(self, 'active', True),
             paused=time.time() < getattr(self, 'silenced_until', 0),
