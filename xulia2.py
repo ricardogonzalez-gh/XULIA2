@@ -2519,7 +2519,7 @@ class VoiceControlAssistant:
             count = self.numbered_buttons.show()
             self.button_mode = count > 0
             if count:
-                self.notify("Botones numerados. Di el número para hacer clic; «cancelar» sale")
+                self.notify("Di el número para hacer clic (por ejemplo «doce» o «número doce»)  ·  los números vuelven para el siguiente  ·  «cancelar» sale")
             else:
                 self.notify("No encontré botones: " + (self.numbered_buttons.reason or "sin motivo"))
             return True
