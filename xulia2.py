@@ -2799,6 +2799,7 @@ class VoiceControlAssistant:
                 self.notify("Di el número para hacer clic (por ejemplo «doce» o «número doce»)  ·  los números vuelven para el siguiente  ·  «cancelar» sale")
             else:
                 self.notify("No encontré botones: " + (self.numbered_buttons.reason or "sin motivo"))
+                self._say('no_buttons')
             return True
         except Exception as exc:
             print("Error mostrando botones:", exc)
@@ -2872,6 +2873,7 @@ class VoiceControlAssistant:
         # la ventana cambió y ya no hay nada clicable: no dejar al usuario preso en el modo
         self._buttons_exit()
         self.notify("Sin botones en esta pantalla: volví al modo comando")
+        self._say('no_buttons')
 
     def _handle_cell_click(self, match, text, normalized):
         try:
