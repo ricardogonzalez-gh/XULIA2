@@ -17,6 +17,7 @@ correct_word=\bcorrigir\s+palavra\s+(\d{1,2}|zero|um|uma|dois|duas|três|tres|qu
 click_button=\b(bot[aã]o|bot[oõ]es|clicar)\b
 ribbon=\b(guia|faixa de op[cç][oõ]es|ribbon)\b
 cell_click=\b(?:c[eé]lula|casilla)\s*(?:n[úu]mero\s*)?(\d{1,3})\b
+grid_fine=posi[cç][aã]o\s+([1-9])
 mouse_up=\b(mouse\s+(?:para\s+)?(?:cima|acima))\b
 mouse_down=\b(mouse\s+(?:para\s+)?(?:baixo|abaixo))\b
 mouse_left=\b(mouse\s+(?:para\s+a\s+)?esquerda)\b
