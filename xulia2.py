@@ -37,7 +37,8 @@ except Exception:
                 pass
 import traceback
 from collections import OrderedDict
-from status_panel import StatusPanel, mode_from_state, panel_enabled
+from status_panel import (StatusPanel, PanelState, accent_glyph, mode_from_state, panel_enabled,
+                          AMARILLO as PANEL_AMARILLO, BLANCO as PANEL_BLANCO)
 import webbrowser
 import tempfile
 from numbered_buttons import NumberedButtons, click_by_name, spoken_number
@@ -958,7 +959,8 @@ class VoiceControlAssistant:
         return image
 
     def _panel_state(self):
-        """(modo, idioma, último) para el panel de estado; se llama desde el hilo de Tk."""
+        """PanelState para el panel de estado (modo, idioma, lo último que se oyó y las fichas); se llama
+        desde el hilo de Tk."""
         mode = mode_from_state(
             active=getattr(self, 'active', True),
             paused=time.time() < getattr(self, 'silenced_until', 0),
@@ -968,7 +970,24 @@ class VoiceControlAssistant:
             spell=getattr(self, 'spell_mode', False),
             accent=bool(getattr(self, 'pending_accent', None)),
         )
-        return mode, self.language, self._panel_last
+        # fichas por orden de importancia: lo que sigue "armado" y afectará a lo próximo que se haga
+        chips = []
+        if getattr(self, '_pending_repeat', None):
+            chips.append(("×%d" % self._pending_repeat, True, PANEL_AMARILLO))
+        for flag, label in (('_ctrl_down', 'Ctrl'), ('_alt_down', 'Alt'), ('_altgr_down', 'AltGr')):
+            if getattr(self, flag, False):
+                chips.append((label, True, PANEL_AMARILLO))
+        if getattr(self, '_shift_locked', False):
+            chips.append(("AA", True, PANEL_BLANCO))
+        elif getattr(self, '_single_shift', False):
+            chips.append(("Aa", True, PANEL_BLANCO))
+        if getattr(self, '_shift_down', False):
+            chips.append(("SEL", True, PANEL_BLANCO))
+        if getattr(self, 'pending_accent', None):
+            chips.append((accent_glyph(self.pending_accent), True, PANEL_AMARILLO))
+        last = self._panel_last   # (instante, texto oído, 'done' | 'refused') o None
+        heard_time, heard, verdict = last if last else (0.0, '', None)
+        return PanelState(mode, self.language, heard, heard_time, verdict, chips)
 
     def _update_tray_icon(self):
         if self.icon is not None:
@@ -1454,7 +1473,7 @@ class VoiceControlAssistant:
                             except Exception:
                                 matched_text = ''
                             print(f"Comando reconocido (deletrear): key='{key}' matched='{matched_text}' text='{text}'")
-                            self._panel_last = (time.time(), matched_text)
+                            self._panel_last = (time.time(), text, 'done')
                             handled = self._dispatch_command_handler(key, handler, match, stripped_spell, normalized_spell)
                             if handled:
                                 return
@@ -1463,7 +1482,7 @@ class VoiceControlAssistant:
                             traceback.print_exc()
                             return
                 # nothing matched in spell mode
-                self._panel_last = (time.time(), None)
+                self._panel_last = (time.time(), text, 'refused')
                 self.notify('Comando no reconocido en modo deletrear')
                 return
             else:
@@ -1484,7 +1503,7 @@ class VoiceControlAssistant:
                             except Exception:
                                 matched_text = ''
                             print(f"Comando reconocido: key='{key}' matched='{matched_text}' text='{text}'")
-                            self._panel_last = (time.time(), matched_text)
+                            self._panel_last = (time.time(), text, 'done')
                             # Pass the stripped text to handlers so they receive the command without the word 'comando'
                             handled = self._dispatch_command_handler(key, handler, match, stripped, normalized)
                             if handled:
@@ -3608,7 +3627,7 @@ class VoiceControlAssistant:
             pyautogui.doubleClick()
             self.notify("Doble clic realizado")
             return
-        self._panel_last = (time.time(), None)
+        self._panel_last = (time.time(), normalized, 'refused')
         self.notify("Comando no reconocido")
 
     def show_help(self):
